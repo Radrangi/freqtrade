@@ -86,6 +86,15 @@ class Backtesting:
                                        "configuration or as cli argument `--timeframe 5m`")
         self.timeframe = str(self.config.get('timeframe'))
         self.timeframe_min = timeframe_to_minutes(self.timeframe)
+        # Load detail timeframe if specified
+        self.timeframe_detail = str(self.config.get('detail_timeframe', ''))
+        if self.timeframe_detail:
+            self.timeframe_detail_min = timeframe_to_minutes(self.timeframe_detail)
+            if self.timeframe_min <= self.timeframe_detail_min:
+                raise OperationalException("Detail timeframe must be smaller than strategy timeframe.")
+
+        else:
+            self.timeframe_detail_min = 0
 
         self.pairlists = PairListManager(self.exchange, self.config)
         if 'VolumePairList' in self.pairlists.name_list:
@@ -158,7 +167,7 @@ class Backtesting:
                 conf['protections'] = strategy.protections
             self.protections = ProtectionManager(self.config, strategy.protections)
 
-    def load_bt_data(self) -> Tuple[Dict[str, DataFrame], TimeRange]:
+    def load_bt_data(self) -> Tuple[Dict[str, DataFrame], TimeRange, Dict[str, DataFrame]]:
         """
         Loads backtest data and returns the data combined with the timerange
         as tuple.
@@ -174,6 +183,18 @@ class Backtesting:
             fail_without_data=True,
             data_format=self.config.get('dataformat_ohlcv', 'json'),
         )
+        if self.timeframe_detail:
+            detail_data = history.load_data(
+                datadir=self.config['datadir'],
+                pairs=self.pairlists.whitelist,
+                timeframe=self.timeframe_detail,
+                timerange=self.timerange,
+                startup_candles=0,
+                fail_without_data=True,
+                data_format=self.config.get('dataformat_ohlcv', 'json'),
+            )
+        else:
+            detail_data = None
 
         min_date, max_date = history.get_timerange(data)
 
@@ -186,7 +207,7 @@ class Backtesting:
                                                  self.required_startup, min_date)
 
         self.progress.set_new_value(1)
-        return data, self.timerange
+        return data, self.timerange, detail_data
 
     def prepare_backtest(self, enable_protections):
         """
@@ -322,7 +343,7 @@ class Backtesting:
         else:
             return sell_row[OPEN_IDX]
 
-    def _get_sell_trade_entry(self, trade: LocalTrade, sell_row: Tuple) -> Optional[LocalTrade]:
+    def _get_sell_trade_entry_123(self, trade: LocalTrade, sell_row: Tuple) -> Optional[LocalTrade]:
         sell_candle_time = sell_row[DATE_IDX].to_pydatetime()
         sell = self.strategy.should_sell(trade, sell_row[OPEN_IDX],  # type: ignore
                                          sell_candle_time, sell_row[BUY_IDX],
@@ -349,6 +370,42 @@ class Backtesting:
             return trade
 
         return None
+
+    def _get_sell_trade_entry(self, trade: LocalTrade, sell_row: Tuple) -> Optional[LocalTrade]:
+        if self.timeframe_detail:
+            sell_candle_time = sell_row[DATE_IDX].to_pydatetime()
+            sell_candle_end = sell_candle_time + timedelta(minutes=self.timeframe_min)
+            # detail_timerange = TimeRange('date', 'date', int(sell_candle_time.timestamp()),
+            #  int(sell_candle_end.timestamp()))
+            # TODO: load inline? this makes the whole process very slow as data is loaded
+            #       "per iteration".
+            # detail_data = history.load_pair_history(
+            #     pair=trade.pair,
+            #     timeframe=self.timeframe_detail,
+            #     timerange=detail_timerange,
+            #     datadir=self.config['datadir'],
+            #     startup_candles=0,
+            #     drop_incomplete=True,
+            #     fill_up_missing=True,
+            #     data_format=self.config.get('dataformat_ohlcv', 'json'),
+            # )
+            detail_data = self.detail_data[trade.pair]
+            detail_data = detail_data.loc[
+                (detail_data['date'] >= sell_candle_time) &
+                (detail_data['date'] < sell_candle_end)
+             ]
+            detail_data['buy'] = sell_row[BUY_IDX]
+            detail_data['sell'] = sell_row[SELL_IDX]
+            headers = ['date', 'buy', 'open', 'close', 'sell', 'low', 'high']
+            for det_row in detail_data[headers].values.tolist():
+                res = self._get_sell_trade_entry_123(trade, det_row)
+                if res:
+                    return res
+
+            return None
+
+        else:
+            return self._get_sell_trade_entry_123(trade, sell_row)
 
     def _enter_trade(self, pair: str, row: List) -> Optional[LocalTrade]:
         try:
@@ -595,7 +652,7 @@ class Backtesting:
         """
         data: Dict[str, Any] = {}
 
-        data, timerange = self.load_bt_data()
+        data, timerange, self.detail_data = self.load_bt_data()
         logger.info("Dataload complete. Calculating indicators")
 
         for strat in self.strategylist:
